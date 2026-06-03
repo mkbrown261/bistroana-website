@@ -34,6 +34,148 @@ app.get('/contact', (c) => {
   return c.html(contactPage())
 })
 
+/* ─── API: AI Chat — Groq key is SERVER-SIDE ONLY, never exposed to client ─── */
+app.post('/api/chat', async (c) => {
+  // Rate-limit guard: max 40 messages per conversation (enforced by message count)
+  try {
+    const body = await c.req.json<{
+      messages: Array<{ role: 'user' | 'assistant'; content: string }>
+    }>()
+
+    // Validate input
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return c.json({ error: 'messages array is required' }, 400)
+    }
+    // Hard cap on conversation length to prevent abuse
+    if (body.messages.length > 40) {
+      return c.json({ error: 'Conversation limit reached. Please start a new chat.' }, 429)
+    }
+    // Validate each message shape
+    for (const msg of body.messages) {
+      if (!['user', 'assistant'].includes(msg.role)) {
+        return c.json({ error: 'Invalid message role' }, 400)
+      }
+      if (typeof msg.content !== 'string' || msg.content.trim().length === 0) {
+        return c.json({ error: 'Message content cannot be empty' }, 400)
+      }
+      // Truncate individual messages to prevent token abuse
+      if (msg.content.length > 2000) {
+        msg.content = msg.content.slice(0, 2000)
+      }
+    }
+
+    // System prompt — defines the catering assistant persona and scope
+    const SYSTEM_PROMPT = `You are a professional AI Catering Assistant for Bistro Ana Cuisine & Catering.
+
+Your primary responsibility is to help customers:
+- Learn about our catering services
+- Understand menu options
+- Get pricing information
+- Understand delivery and pickup options
+- Determine serving sizes and quantities
+- Compare catering packages
+- Choose the best option for their event
+- Answer questions about ordering and scheduling
+
+PERSONALITY:
+- Friendly and professional
+- Helpful but concise
+- Conversational and welcoming
+- Sales-oriented without being pushy
+- Focused on helping customers make decisions
+
+SCOPE — You MUST ONLY answer questions related to:
+Catering services, catering menu items, food packages, event planning related to catering, pricing, delivery, pickup, serving sizes, food recommendations, scheduling orders, catering availability, event guest counts.
+
+OUT-OF-SCOPE — You MUST NOT answer questions about:
+Politics, news, medical advice, legal advice, software development, coding, mathematics tutoring, general knowledge unrelated to catering, personal opinions, current events, or anything not related to catering.
+
+If asked something out of scope, respond ONLY with:
+"I'm here to help with catering services, menu options, pricing, delivery, and event planning. I can't assist with topics outside of catering. How can I help with your event today?"
+
+HANDLING UNKNOWN INFORMATION:
+- Never invent pricing, menu items, delivery zones, discounts, or policies not provided.
+- If information is unavailable say: "I don't currently have that information available. Please contact our team directly at hello@bistroana.com or call +1 (212) 555-0192."
+
+BISTRO ANA SERVICES & PRICING:
+- The Gathering Package: From $65/person — 2-course plated service, choice of 3 entrées, non-alcoholic beverages, service staff (4 hrs), setup & breakdown. Best for intimate events 20–50 guests.
+- The Celebration Package: From $110/person — 4-course plated service, chef's tasting menu option, wine pairing available, dedicated event coordinator, full service staff (6 hrs), custom menu design. Best for weddings and milestone events 50–200 guests.
+- The Grand Affair Package: Custom pricing — 6-course grand menu, sommelier wine service, live carving & action stations, personalized menu cards, valet coordination, full décor partnership, premium bar package. Best for black-tie galas 200+ guests.
+
+MENU HIGHLIGHTS:
+Starters: Roasted Heirloom Beet Salad ($18), Tuna Tartare ($24), Butternut Squash Bisque ($16), Burrata & Heirloom Tomato ($20), Seared Diver Scallops ($28), Charcuterie & Artisan Cheese ($32)
+Mains: Pan-Seared Duck Breast (MP), Grass-Fed Beef Tenderloin ($52), Pan-Roasted Atlantic Salmon ($38), Lamb Rack Provençal ($48), Saffron Risotto ($28), Free-Range Chicken Ballotine ($36)
+Desserts: Lavender Crème Brûlée ($14), Dark Chocolate Fondant ($16), Seasonal Fruit Tart ($13)
+Beverages: Curated Wine Pairing from $45/person, Craft Cocktail Service from $18/drink, Champagne Toast Package from $35/person
+
+DIETARY ACCOMMODATIONS: Vegan, Gluten-Free, Nut-Free, Halal, Kosher, Dairy-Free — all available with advance notice.
+
+BOOKING & LOGISTICS:
+- Minimum 20 guests for full-service catering (private chef experience from 6 guests)
+- Book 8–12 weeks in advance for weddings/large events; 4–6 weeks for smaller gatherings
+- Service within 100-mile radius; travel fees apply beyond 30 miles
+- Contact: hello@bistroana.com | +1 (212) 555-0192 | Mon–Fri 9AM–6PM, Sat 10AM–4PM
+
+DECISION HELPER — When a customer needs catering help, ask for:
+1. Event type
+2. Number of guests
+3. Budget range
+4. Delivery or pickup preference
+5. Desired food style
+Then recommend the most appropriate package and explain why it fits their needs.
+
+Always guide customers toward booking. Keep responses concise and helpful.`
+
+    // Groq API key — loaded from Cloudflare environment variable only.
+    // Set via: npx wrangler pages secret put GROQ_API_KEY --project-name bistroana-cuisine
+    // SECURITY: This key is NEVER sent to the browser. All Groq calls happen server-side only.
+    const groqApiKey = (c.env as Record<string, string>)?.GROQ_API_KEY
+
+    if (!groqApiKey) {
+      return c.json({ error: 'Chat service temporarily unavailable.' }, 503)
+    }
+
+    // Call Groq API
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${groqApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          ...body.messages,
+        ],
+        max_tokens: 500,
+        temperature: 0.4,
+        stream: false,
+      }),
+    })
+
+    if (!groqRes.ok) {
+      const errText = await groqRes.text()
+      console.error('Groq API error:', groqRes.status, errText)
+      return c.json({ error: 'Chat service temporarily unavailable. Please try again.' }, 502)
+    }
+
+    const groqData = await groqRes.json<{
+      choices: Array<{ message: { content: string } }>
+    }>()
+
+    const reply = groqData?.choices?.[0]?.message?.content?.trim()
+    if (!reply) {
+      return c.json({ error: 'No response from assistant.' }, 502)
+    }
+
+    return c.json({ reply })
+  } catch (err) {
+    console.error('Chat API error:', err)
+    return c.json({ error: 'Invalid request.' }, 400)
+  }
+})
+
 /* ─── API: Contact form (server-side, no secrets exposed) ─── */
 app.post('/api/contact', async (c) => {
   try {
@@ -577,6 +719,439 @@ ${content}
     </div>
   </div>
 </footer>
+
+<!-- ══════════════════════════════════════════
+     BISTRO ANA — AI CHAT WIDGET
+     Key is NEVER in this HTML. All AI calls
+     go through /api/chat on the server.
+══════════════════════════════════════════ -->
+
+<!-- Chat bubble trigger -->
+<button id="chat-bubble" aria-label="Open catering assistant chat"
+  style="
+    position:fixed;bottom:28px;right:28px;z-index:8000;
+    width:60px;height:60px;border-radius:50%;
+    background:linear-gradient(135deg,var(--gold) 0%,var(--gold-dark) 100%);
+    border:none;cursor:pointer;
+    box-shadow:0 8px 32px rgba(201,168,76,.55), 0 2px 8px rgba(0,0,0,.2);
+    display:flex;align-items:center;justify-content:center;
+    transition:transform .25s cubic-bezier(.4,0,.2,1), box-shadow .25s ease;
+    color:var(--espresso);
+    font-size:1.5rem;
+  "
+  onmouseenter="this.style.transform='scale(1.08) translateY(-2px)';this.style.boxShadow='0 12px 40px rgba(201,168,76,.65), 0 4px 12px rgba(0,0,0,.25)'"
+  onmouseleave="this.style.transform='scale(1)';this.style.boxShadow='0 8px 32px rgba(201,168,76,.55), 0 2px 8px rgba(0,0,0,.2)'"
+  onclick="toggleChat()"
+>
+  <i class="fas fa-comment-dots" id="chat-bubble-icon"></i>
+  <!-- Unread badge -->
+  <span id="chat-badge" style="
+    position:absolute;top:-2px;right:-2px;
+    width:18px;height:18px;border-radius:50%;
+    background:#e74c3c;color:#fff;
+    font-size:.6rem;font-weight:700;
+    display:flex;align-items:center;justify-content:center;
+    border:2px solid var(--cream);
+    font-family:'Inter',sans-serif;
+  ">1</span>
+</button>
+
+<!-- Chat window -->
+<div id="chat-window" role="dialog" aria-modal="true" aria-label="Bistro Ana catering assistant" style="
+  position:fixed;bottom:100px;right:28px;z-index:8001;
+  width:min(400px, calc(100vw - 32px));
+  height:min(580px, calc(100vh - 130px));
+  background:#fff;
+  border-radius:20px;
+  box-shadow:0 24px 80px rgba(26,10,0,.22), 0 4px 20px rgba(0,0,0,.12);
+  display:none;
+  flex-direction:column;
+  overflow:hidden;
+  border:1px solid rgba(201,168,76,.2);
+  transform:scale(.92) translateY(16px);
+  opacity:0;
+  transition:transform .3s cubic-bezier(.4,0,.2,1), opacity .3s ease;
+">
+  <!-- Header -->
+  <header style="
+    background:linear-gradient(135deg,var(--espresso) 0%,var(--espresso-mid) 100%);
+    padding:18px 20px;
+    display:flex;align-items:center;gap:12px;
+    flex-shrink:0;
+  ">
+    <div style="
+      width:40px;height:40px;border-radius:50%;
+      background:linear-gradient(135deg,var(--gold),var(--gold-dark));
+      display:flex;align-items:center;justify-content:center;
+      flex-shrink:0;
+      box-shadow:0 4px 12px rgba(201,168,76,.4);
+    ">
+      <i class="fas fa-utensils" style="color:var(--espresso);font-size:.9rem"></i>
+    </div>
+    <div style="flex:1;min-width:0">
+      <div style="font-family:'Cormorant Garamond',serif;font-size:1.05rem;font-weight:600;color:#fff;line-height:1.1">
+        Bistro Ana Assistant
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:3px">
+        <span style="width:7px;height:7px;border-radius:50%;background:#4caf50;display:inline-block;animation:pulse-dot 2s infinite"></span>
+        <span style="font-size:.72rem;color:rgba(255,255,255,.65);font-family:'Inter',sans-serif;letter-spacing:.04em">Online · Typically replies instantly</span>
+      </div>
+    </div>
+    <button onclick="toggleChat()" aria-label="Close chat" style="
+      background:rgba(255,255,255,.1);border:none;cursor:pointer;
+      width:30px;height:30px;border-radius:50%;
+      color:rgba(255,255,255,.8);font-size:.9rem;
+      display:flex;align-items:center;justify-content:center;
+      transition:background .2s;flex-shrink:0;
+    " onmouseenter="this.style.background='rgba(255,255,255,.2)'"
+       onmouseleave="this.style.background='rgba(255,255,255,.1)'">
+      <i class="fas fa-times"></i>
+    </button>
+  </header>
+
+  <!-- Messages container -->
+  <div id="chat-messages" style="
+    flex:1;overflow-y:auto;padding:20px 16px;
+    display:flex;flex-direction:column;gap:12px;
+    scroll-behavior:smooth;
+    background:linear-gradient(180deg,#fdfaf7 0%,#fff 100%);
+  " aria-live="polite" aria-atomic="false">
+    <!-- Messages injected by JS -->
+  </div>
+
+  <!-- Typing indicator (hidden by default) -->
+  <div id="chat-typing" style="
+    display:none;padding:0 16px 8px;
+    flex-shrink:0;
+  ">
+    <div style="
+      background:#f0ebe4;border-radius:18px 18px 18px 4px;
+      padding:10px 16px;display:inline-flex;align-items:center;gap:5px;
+    ">
+      <span class="typing-dot" style="width:7px;height:7px;border-radius:50%;background:#c9a84c;animation:typing-bounce .8s infinite 0s"></span>
+      <span class="typing-dot" style="width:7px;height:7px;border-radius:50%;background:#c9a84c;animation:typing-bounce .8s infinite .15s"></span>
+      <span class="typing-dot" style="width:7px;height:7px;border-radius:50%;background:#c9a84c;animation:typing-bounce .8s infinite .3s"></span>
+    </div>
+  </div>
+
+  <!-- Quick reply chips -->
+  <div id="chat-chips" style="
+    display:flex;flex-wrap:wrap;gap:7px;
+    padding:0 16px 8px;flex-shrink:0;
+  ">
+    <button class="chip" onclick="sendChip(this)" style="
+      background:#fdf7ef;border:1.5px solid rgba(201,168,76,.4);
+      color:var(--espresso);font-family:'Inter',sans-serif;
+      font-size:.73rem;font-weight:500;letter-spacing:.03em;
+      padding:6px 13px;border-radius:20px;cursor:pointer;
+      transition:all .2s;white-space:nowrap;
+    ">💍 Wedding</button>
+    <button class="chip" onclick="sendChip(this)" style="
+      background:#fdf7ef;border:1.5px solid rgba(201,168,76,.4);
+      color:var(--espresso);font-family:'Inter',sans-serif;
+      font-size:.73rem;font-weight:500;letter-spacing:.03em;
+      padding:6px 13px;border-radius:20px;cursor:pointer;
+      transition:all .2s;white-space:nowrap;
+    ">🏢 Corporate</button>
+    <button class="chip" onclick="sendChip(this)" style="
+      background:#fdf7ef;border:1.5px solid rgba(201,168,76,.4);
+      color:var(--espresso);font-family:'Inter',sans-serif;
+      font-size:.73rem;font-weight:500;letter-spacing:.03em;
+      padding:6px 13px;border-radius:20px;cursor:pointer;
+      transition:all .2s;white-space:nowrap;
+    ">💰 Pricing</button>
+    <button class="chip" onclick="sendChip(this)" style="
+      background:#fdf7ef;border:1.5px solid rgba(201,168,76,.4);
+      color:var(--espresso);font-family:'Inter',sans-serif;
+      font-size:.73rem;font-weight:500;letter-spacing:.03em;
+      padding:6px 13px;border-radius:20px;cursor:pointer;
+      transition:all .2s;white-space:nowrap;
+    ">🚚 Delivery</button>
+    <button class="chip" onclick="sendChip(this)" style="
+      background:#fdf7ef;border:1.5px solid rgba(201,168,76,.4);
+      color:var(--espresso);font-family:'Inter',sans-serif;
+      font-size:.73rem;font-weight:500;letter-spacing:.03em;
+      padding:6px 13px;border-radius:20px;cursor:pointer;
+      transition:all .2s;white-space:nowrap;
+    ">🍽️ Menu</button>
+  </div>
+
+  <!-- Input bar -->
+  <form id="chat-form" onsubmit="handleChatSubmit(event)" style="
+    display:flex;gap:10px;align-items:flex-end;
+    padding:12px 16px;border-top:1px solid rgba(232,221,208,.6);
+    background:#fff;flex-shrink:0;
+  ">
+    <textarea
+      id="chat-input"
+      rows="1"
+      placeholder="Ask about menus, pricing, delivery…"
+      maxlength="500"
+      aria-label="Chat message"
+      style="
+        flex:1;resize:none;border:1.5px solid var(--parchment);
+        border-radius:12px;padding:10px 14px;
+        font-family:'Inter',sans-serif;font-size:.875rem;
+        line-height:1.5;max-height:100px;overflow-y:auto;
+        outline:none;transition:border-color .2s;
+        background:#fdfaf7;color:var(--charcoal);
+      "
+      onfocus="this.style.borderColor='var(--gold)'"
+      onblur="this.style.borderColor='var(--parchment)'"
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();handleChatSubmit(event)}"
+      oninput="autoResizeTextarea(this)"
+    ></textarea>
+    <button type="submit" id="chat-send" aria-label="Send message" style="
+      width:40px;height:40px;border-radius:50%;
+      background:linear-gradient(135deg,var(--gold),var(--gold-dark));
+      border:none;cursor:pointer;
+      display:flex;align-items:center;justify-content:center;
+      color:var(--espresso);font-size:.9rem;
+      flex-shrink:0;
+      transition:transform .2s, box-shadow .2s;
+      box-shadow:0 4px 12px rgba(201,168,76,.35);
+    "
+    onmouseenter="this.style.transform='scale(1.08)'"
+    onmouseleave="this.style.transform='scale(1)'">
+      <i class="fas fa-paper-plane" id="send-icon"></i>
+    </button>
+  </form>
+
+  <!-- Powered-by footer -->
+  <div style="
+    text-align:center;padding:6px 0 10px;
+    font-size:.68rem;color:#bbb;font-family:'Inter',sans-serif;
+    flex-shrink:0;background:#fff;
+  ">
+    Powered by Bistro Ana AI · <a href="/contact" style="color:var(--gold);text-decoration:none">Book an event</a>
+  </div>
+</div>
+
+<!-- Chat styles -->
+<style>
+  @keyframes pulse-dot {
+    0%,100%{opacity:1;transform:scale(1)}
+    50%{opacity:.6;transform:scale(.85)}
+  }
+  @keyframes typing-bounce {
+    0%,60%,100%{transform:translateY(0)}
+    30%{transform:translateY(-5px)}
+  }
+  @keyframes msg-in {
+    from{opacity:0;transform:translateY(8px)}
+    to{opacity:1;transform:none}
+  }
+  #chat-window.open {
+    display:flex !important;
+    transform:scale(1) translateY(0) !important;
+    opacity:1 !important;
+  }
+  .chip:hover {
+    background:var(--gold) !important;
+    border-color:var(--gold) !important;
+    color:var(--espresso) !important;
+    transform:translateY(-1px);
+  }
+  /* Scrollbar styling for chat messages */
+  #chat-messages::-webkit-scrollbar { width:4px; }
+  #chat-messages::-webkit-scrollbar-track { background:transparent; }
+  #chat-messages::-webkit-scrollbar-thumb { background:var(--parchment); border-radius:4px; }
+
+  /* Mobile adjustments */
+  @media (max-width: 480px) {
+    #chat-window {
+      bottom: 0 !important; right: 0 !important;
+      width: 100vw !important;
+      height: calc(100vh - 70px) !important;
+      border-radius: 20px 20px 0 0 !important;
+    }
+    #chat-bubble { bottom: 20px !important; right: 20px !important; }
+  }
+</style>
+
+<!-- Chat JavaScript — NO secrets here, all AI calls go to /api/chat -->
+<script>
+(function() {
+  'use strict';
+
+  // ── State ──────────────────────────────────────
+  let messages = [];          // [{role, content}]
+  let isOpen   = false;
+  let isLoading = false;
+  let greeted  = false;
+
+  // ── DOM refs ───────────────────────────────────
+  const win     = document.getElementById('chat-window');
+  const msgBox  = document.getElementById('chat-messages');
+  const input   = document.getElementById('chat-input');
+  const typing  = document.getElementById('chat-typing');
+  const badge   = document.getElementById('chat-badge');
+  const icon    = document.getElementById('chat-bubble-icon');
+  const sendBtn = document.getElementById('chat-send');
+  const sendIco = document.getElementById('send-icon');
+  const chips   = document.getElementById('chat-chips');
+
+  // ── Toggle open/close ──────────────────────────
+  window.toggleChat = function() {
+    isOpen = !isOpen;
+    if (isOpen) {
+      win.style.display = 'flex';
+      // Animate in
+      requestAnimationFrame(() => win.classList.add('open'));
+      badge.style.display = 'none';
+      icon.className = 'fas fa-times';
+      document.body.style.overflow = window.innerWidth < 480 ? 'hidden' : '';
+      if (!greeted) {
+        greeted = true;
+        setTimeout(() => greet(), 350);
+      } else {
+        scrollToBottom();
+      }
+      input.focus();
+    } else {
+      win.classList.remove('open');
+      icon.className = 'fas fa-comment-dots';
+      document.body.style.overflow = '';
+      setTimeout(() => { if (!isOpen) win.style.display = 'none'; }, 300);
+    }
+  };
+
+  // ── Greeting ───────────────────────────────────
+  function greet() {
+    const msg = "👋 Hi! Welcome to Bistro Ana. I can help with menu options, pricing, serving sizes, delivery, and choosing the right package for your event. What type of event are you planning?";
+    appendMessage('assistant', msg, true);
+  }
+
+  // ── Render a message bubble ────────────────────
+  function appendMessage(role, text, animate) {
+    const isUser = role === 'user';
+    const wrap = document.createElement('div');
+    wrap.style.cssText = [
+      'display:flex',
+      isUser ? 'justify-content:flex-end' : 'justify-content:flex-start',
+      'animation:msg-in .3s ease both',
+      'align-items:flex-end',
+      'gap:8px',
+    ].join(';');
+
+    if (!isUser) {
+      // Avatar
+      const av = document.createElement('div');
+      av.style.cssText = 'width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#c9a84c,#a67c2e);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:.7rem;color:#1a0a00';
+      av.innerHTML = '<i class="fas fa-utensils"></i>';
+      wrap.appendChild(av);
+    }
+
+    const bubble = document.createElement('div');
+    bubble.style.cssText = [
+      'max-width:78%',
+      'padding:10px 14px',
+      'border-radius:' + (isUser ? '18px 18px 4px 18px' : '18px 18px 18px 4px'),
+      'font-family:Inter,sans-serif',
+      'font-size:.875rem',
+      'line-height:1.65',
+      'word-break:break-word',
+      isUser
+        ? 'background:linear-gradient(135deg,#c9a84c,#a67c2e);color:#1a0a00;box-shadow:0 4px 12px rgba(201,168,76,.3)'
+        : 'background:#f0ebe4;color:#2c2c2c;box-shadow:0 2px 6px rgba(0,0,0,.06)',
+    ].join(';');
+
+    // Sanitize text (prevent XSS — no innerHTML for user content)
+    bubble.textContent = text;
+
+    wrap.appendChild(bubble);
+    msgBox.appendChild(wrap);
+    scrollToBottom();
+
+    return wrap;
+  }
+
+  function scrollToBottom() {
+    msgBox.scrollTop = msgBox.scrollHeight;
+  }
+
+  function setLoading(v) {
+    isLoading = v;
+    typing.style.display = v ? 'block' : 'none';
+    sendBtn.disabled = v;
+    input.disabled = v;
+    sendIco.className = v ? 'fas fa-circle-notch fa-spin' : 'fas fa-paper-plane';
+    if (v) scrollToBottom();
+  }
+
+  // ── Send a message ─────────────────────────────
+  async function sendMessage(text) {
+    if (!text || isLoading) return;
+
+    // Hide chips after first interaction
+    chips.style.display = 'none';
+
+    // Add user message to UI
+    appendMessage('user', text, true);
+    messages.push({ role: 'user', content: text });
+
+    setLoading(true);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || data.error) {
+        throw new Error(data.error || 'Request failed');
+      }
+
+      appendMessage('assistant', data.reply, true);
+      messages.push({ role: 'assistant', content: data.reply });
+
+    } catch (err) {
+      appendMessage('assistant', "I'm sorry, I'm having trouble connecting right now. Please try again or contact us at hello@bistroana.com.", true);
+    } finally {
+      setLoading(false);
+      input.focus();
+    }
+  }
+
+  // ── Form submit ────────────────────────────────
+  window.handleChatSubmit = function(e) {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text || isLoading) return;
+    input.value = '';
+    input.style.height = 'auto';
+    sendMessage(text);
+  };
+
+  // ── Quick reply chips ──────────────────────────
+  window.sendChip = function(btn) {
+    const chipMap = {
+      '💍 Wedding':   "I'm planning a wedding and need catering. Can you help?",
+      '🏢 Corporate': "What catering options do you have for corporate events?",
+      '💰 Pricing':   "Can you give me an overview of your pricing?",
+      '🚚 Delivery':  "Do you offer delivery? What areas do you cover?",
+      '🍽️ Menu':      "Can you tell me about your menu options?",
+    };
+    const msg = chipMap[btn.textContent.trim()] || btn.textContent.trim();
+    sendMessage(msg);
+  };
+
+  // ── Auto-resize textarea ───────────────────────
+  window.autoResizeTextarea = function(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 100) + 'px';
+  };
+
+  // ── Close on backdrop (mobile) ─────────────────
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isOpen) window.toggleChat();
+  });
+
+})();
+</script>
 
 <!-- ── Global JS ── -->
 <script>
